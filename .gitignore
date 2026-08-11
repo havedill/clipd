@@ -1,0 +1,10 @@
+/target/
+*.db
+*.db-*
+*.swp
+*.swo
+*~
+.idea/
+.vscode/
+*.code-workspace
+.DS_Store
