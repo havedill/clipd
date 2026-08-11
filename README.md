@@ -1,44 +1,38 @@
 # clipd
 
-Clipboard history for **KDE Plasma (Wayland)**.
+Clipboard history for **KDE Plasma on Wayland**.
 
-Plasma owns the hotkey (default **Ctrl+D**). `clipd` never registers global shortcuts itself.
+Plasma owns the hotkey (default **Ctrl+D**). `clipd` does not register global shortcuts itself.
 
-## Install (Arch / CachyOS)
+## Install
+
+**Needs:** Rust (`cargo`), `wl-clipboard`, and `wtype` (or `ydotool`).
 
 ```bash
-sudo pacman -S --needed rust wl-clipboard wtype
 git clone https://github.com/havedill/clipd.git
 cd clipd
 cargo install --path . --force
 clipd install
 ```
 
-That’s it. Then copy something and press **Ctrl+D**.
+Copy something, then press **Ctrl+D**.
 
-### Optional
+If the shortcut does nothing: **System Settings → Keyboard → Shortcuts** → search **clipd** → set your key → Apply (or log out once).
 
-```bash
-# If CopyQ is fighting the same hotkey:
-clipd install --disable-copyq
-```
-
-If Ctrl+D still goes to the browser: **System Settings → Keyboard → Shortcuts** → search **clipd** → set Ctrl+D → Apply (or log out once).
-
-## Everyday use
+## Use
 
 | Action | How |
 |--------|-----|
-| History popup | Ctrl+D (or `clipd show`) |
-| Settings / max items | Popup → **Settings** |
-| Pause hotkey | Tray icon, or Settings |
+| Open history | Ctrl+D / `clipd show` |
+| Settings | Popup → **Settings** |
+| Pause hotkey | Tray icon or Settings |
 | Status | `clipd status` |
 
 ## Config
 
-`~/.config/clipd/config.toml` — `max_items`, `shortcut` (documented; Plasma binds it), window size.
+`~/.config/clipd/config.toml` — history limit, documented shortcut, window size.
 
-History is encrypted on disk (`~/.local/share/clipd/history.db`); the key lives in KWallet / Secret Service.
+History is stored encrypted under `~/.local/share/clipd/` (key in KWallet / Secret Service).
 
 ## License
 

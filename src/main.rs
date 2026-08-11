@@ -32,11 +32,8 @@ enum Cmd {
     Show,
     /// Print daemon status
     Status,
-    /// Install desktop files, autostart unit, Plasma Ctrl+D; disable CopyQ conflict
-    Install {
-        #[arg(long)]
-        disable_copyq: bool,
-    },
+    /// Install desktop files, autostart, and Plasma shortcut
+    Install,
 }
 
 fn main() -> Result<()> {
@@ -49,6 +46,6 @@ fn main() -> Result<()> {
             println!("{s}");
             Ok(())
         }
-        Cmd::Install { disable_copyq } => install::run(disable_copyq),
+        Cmd::Install => install::run(),
     }
 }
