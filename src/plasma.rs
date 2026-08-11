@@ -135,16 +135,31 @@ pub fn set_shortcut_enabled(enabled: bool, shortcut: &str) -> Result<()> {
 
 /// Move the mapped `clipd` window to the pointer. Wayland clients cannot set
 /// absolute position themselves; KWin scripting can.
-pub fn move_show_to_cursor() -> Result<()> {
+///
+/// When `size` is set (`[width, height]` in points), also force the frame size —
+/// Wayland often ignores the client's initial `with_inner_size`.
+pub fn move_show_to_cursor(size: Option<[f32; 2]>) -> Result<()> {
     let dir = dirs::cache_dir()
         .unwrap_or_else(|| PathBuf::from("/tmp"))
         .join("clipd");
     fs::create_dir_all(&dir)?;
     let script = dir.join("place-near-cursor.js");
+
+    let (force_w, force_h, force_size) = match size {
+        Some([w, h]) if w >= 320.0 && h >= 240.0 => {
+            (w.round() as i32, h.round() as i32, "true")
+        }
+        _ => (0, 0, "false"),
+    };
+
     fs::write(
         &script,
-        r#"(function () {
-    function place(w) {
+        format!(
+            r#"(function () {{
+    var FORCE_SIZE = {force_size};
+    var WANT_W = {force_w};
+    var WANT_H = {force_h};
+    function place(w) {{
         var cls = (w.resourceClass || "") + "";
         var cap = (w.caption || "") + "";
         var nam = (w.resourceName || "") + "";
@@ -152,46 +167,48 @@ pub fn move_show_to_cursor() -> Result<()> {
 
         var pos = workspace.cursorPos;
         var g = w.frameGeometry;
+        // WANT_* is egui content size; add a little for title-bar chrome when forcing.
+        var winW = FORCE_SIZE ? (WANT_W + 0) : g.width;
+        var winH = FORCE_SIZE ? (WANT_H + 36) : g.height;
         var area;
-        try {
+        try {{
             area = workspace.clientArea(KWin.MaximizeArea, w);
-        } catch (e) {
-            area = { x: 0, y: 0, width: 3840, height: 2160 };
-        }
+        }} catch (e) {{
+            area = {{ x: 0, y: 0, width: 3840, height: 2160 }};
+        }}
 
         var margin = 12;
         var x = Math.round(pos.x + margin);
         var y = Math.round(pos.y + margin);
 
-        // Prefer below-right of cursor; flip if that would leave the work area.
-        if (y + g.height > area.y + area.height) {
-            y = Math.round(pos.y - margin - g.height);
-        }
-        if (x + g.width > area.x + area.width) {
-            x = Math.round(pos.x - margin - g.width);
-        }
+        if (y + winH > area.y + area.height) {{
+            y = Math.round(pos.y - margin - winH);
+        }}
+        if (x + winW > area.x + area.width) {{
+            x = Math.round(pos.x - margin - winW);
+        }}
 
-        // Hard clamp so the whole frame stays on-screen (panels accounted for).
-        var maxX = area.x + area.width - g.width;
-        var maxY = area.y + area.height - g.height;
+        var maxX = area.x + area.width - winW;
+        var maxY = area.y + area.height - winH;
         if (maxX < area.x) maxX = area.x;
         if (maxY < area.y) maxY = area.y;
         x = Math.max(area.x, Math.min(x, maxX));
         y = Math.max(area.y, Math.min(y, maxY));
 
-        try {
-            w.frameGeometry = Qt.rect(x, y, g.width, g.height);
-        } catch (e) {
-            w.frameGeometry = { x: x, y: y, width: g.width, height: g.height };
-        }
+        try {{
+            w.frameGeometry = Qt.rect(x, y, winW, winH);
+        }} catch (e) {{
+            w.frameGeometry = {{ x: x, y: y, width: winW, height: winH }};
+        }}
         return true;
-    }
+    }}
     var list = workspace.stackingOrder;
-    for (var i = 0; i < list.length; i++) {
+    for (var i = 0; i < list.length; i++) {{
         if (place(list[i])) return;
-    }
-})();
-"#,
+    }}
+}})();
+"#
+        ),
     )?;
 
     let path = script.display().to_string();
@@ -229,6 +246,5 @@ pub fn move_show_to_cursor() -> Result<()> {
             "org.kde.kwin.Script.run",
         ])
         .status();
-    // Leave loaded; next call unloads/reloads. Avoid unload races while popup lives.
     Ok(())
 }

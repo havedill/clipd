@@ -1,69 +1,44 @@
 # clipd
 
-Minimal clipboard history for **KDE Plasma on Wayland**.
+Clipboard history for **KDE Plasma (Wayland)**.
 
-Plasma owns the global hotkey (default Ctrl+D → `clipd show`). This binary never registers global shortcuts itself — that pattern is what breaks for many clipboard managers after Plasma / `kglobalacceld` updates.
+Plasma owns the hotkey (default **Ctrl+D**). `clipd` never registers global shortcuts itself.
 
-## Features
-
-- Text and image history
-- Encrypted-at-rest SQLite (AES-256-GCM; key in KWallet / Secret Service)
-- Configurable `max_items`
-- Autostart via systemd user unit + desktop file
-- Tray menu: show history, pause/resume the Plasma shortcut
-- Popup: search, preview, settings, close on unfocus, place near cursor (via KWin)
-
-## Build
+## Install (Arch / CachyOS)
 
 ```bash
-cargo build --release
+sudo pacman -S --needed rust wl-clipboard wtype
+git clone https://github.com/havedill/clipd.git
+cd clipd
 cargo install --path . --force
+clipd install
 ```
 
-Requires a recent Rust toolchain (`edition = "2021"`).
+That’s it. Then copy something and press **Ctrl+D**.
 
-## Runtime dependencies
-
-| Tool | Role |
-|------|------|
-| `wl-clipboard` | Watch / set clipboard (`wl-paste`, `wl-copy`) |
-| `wtype` or `ydotool` | Inject Ctrl+V on select (`wtype` preferred) |
-| KWallet / Secret Service | Store the encryption key |
-| Plasma / KWin | Global shortcut + cursor placement |
+### Optional
 
 ```bash
-# Arch / CachyOS example
-sudo pacman -S --needed wl-clipboard wtype
-```
-
-## Setup
-
-```bash
-clipd install                 # desktop files, systemd user unit, Plasma shortcut
-# optional, if migrating away from CopyQ:
+# If CopyQ is fighting the same hotkey:
 clipd install --disable-copyq
-
-systemctl --user status clipd
-clipd status
-clipd show
 ```
 
-If the hotkey does not fire while a browser has focus, open **System Settings → Keyboard → Shortcuts**, find **clipd History** (or re-run `clipd install`), bind your key, Apply — or log out/in once so Plasma reloads global accel.
+If Ctrl+D still goes to the browser: **System Settings → Keyboard → Shortcuts** → search **clipd** → set Ctrl+D → Apply (or log out once).
 
-## Paths
+## Everyday use
 
-| What | Where |
-|------|--------|
-| Config | `~/.config/clipd/config.toml` |
-| Encrypted DB | `~/.local/share/clipd/history.db` |
-| Socket | `$XDG_RUNTIME_DIR/clipd.sock` |
-| Shortcut desktop | `~/.local/share/kglobalaccel/clipd-show.desktop` |
+| Action | How |
+|--------|-----|
+| History popup | Ctrl+D (or `clipd show`) |
+| Settings / max items | Popup → **Settings** |
+| Pause hotkey | Tray icon, or Settings |
+| Status | `clipd status` |
 
-## Security notes
+## Config
 
-- History payloads on disk are ciphertext. Without the Secret Service key, the DB is not readable as plaintext.
-- The daemon and UI talk over a Unix socket in `XDG_RUNTIME_DIR` (same-user only).
-- Pausing the shortcut unbinds the Plasma hotkey temporarily so apps can use that key chord.
+`~/.config/clipd/config.toml` — `max_items`, `shortcut` (documented; Plasma binds it), window size.
+
+History is encrypted on disk (`~/.local/share/clipd/history.db`); the key lives in KWallet / Secret Service.
 
 ## License
 

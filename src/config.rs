@@ -11,6 +11,9 @@ pub struct Config {
     /// Documented only — Plasma binds this. clipd never registers it.
     pub shortcut: String,
     pub autostart: bool,
+    /// Last popup inner size (points).
+    pub window_width: f32,
+    pub window_height: f32,
 }
 
 impl Default for Config {
@@ -19,6 +22,8 @@ impl Default for Config {
             max_items: 200,
             shortcut: "Ctrl+D".into(),
             autostart: true,
+            window_width: 560.0,
+            window_height: 480.0,
         }
     }
 }
@@ -28,6 +33,18 @@ impl Config {
         dirs::config_dir()
             .unwrap_or_else(|| PathBuf::from("."))
             .join("clipd/config.toml")
+    }
+
+    pub fn clamped_window_size(&self) -> [f32; 2] {
+        [
+            self.window_width.clamp(320.0, 4000.0),
+            self.window_height.clamp(240.0, 3000.0),
+        ]
+    }
+
+    pub fn set_window_size(&mut self, w: f32, h: f32) {
+        self.window_width = w.clamp(320.0, 4000.0);
+        self.window_height = h.clamp(240.0, 3000.0);
     }
 
     pub fn load() -> Result<Self> {

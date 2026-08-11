@@ -7,8 +7,8 @@ license = "MIT"
 readme = "README.md"
 keywords = ["clipboard", "wayland", "plasma", "kde"]
 categories = ["command-line-utilities"]
-# repository = "https://github.com/YOU/clipd"  # set when published
-
+repository = "https://github.com/havedill/clipd"
+homepage = "https://github.com/havedill/clipd"
 
 [dependencies]
 anyhow = "1"

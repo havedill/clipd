@@ -3,19 +3,35 @@ use crate::ipc;
 use crate::plasma;
 use crate::store::{ItemMeta, Kind};
 use anyhow::{Context, Result};
-use eframe::egui;
+use eframe::egui::{self, Color32, CornerRadius, Frame, Margin, RichText, Sense, Stroke};
 use std::time::{Duration, Instant};
+
+// High-contrast dark palette (option 3).
+const BG: Color32 = Color32::from_rgb(0x12, 0x14, 0x17);
+const PANEL: Color32 = Color32::from_rgb(0x1a, 0x1d, 0x21);
+const TEXT: Color32 = Color32::from_rgb(0xf2, 0xf4, 0xf8);
+const MUTED: Color32 = Color32::from_rgb(0x9a, 0xa3, 0xad);
+const SELECTED: Color32 = Color32::from_rgb(0x2f, 0x6f, 0xed);
+const HOVER: Color32 = Color32::from_rgb(0x2a, 0x30, 0x38);
+const INPUT: Color32 = Color32::from_rgb(0x24, 0x28, 0x2e);
+const BADGE_TEXT: Color32 = Color32::from_rgb(0x6b, 0x7c, 0x93);
+const BADGE_IMG: Color32 = Color32::from_rgb(0x1a, 0x9e, 0x8f);
+const AMBER: Color32 = Color32::from_rgb(0xff, 0xb0, 0x20);
+const ERROR: Color32 = Color32::from_rgb(0xff, 0x5c, 0x5c);
 
 pub fn run_show() -> Result<()> {
     let _ = ipc::status().context("daemon not reachable — start `clipd daemon` (or enable autostart)")?;
     let status = ipc::status_msg()?;
     let items = ipc::list(status.max_items.max(1)).context("list history")?;
+    let cfg = Config::load().unwrap_or_default();
+    let size = cfg.clamped_window_size();
 
     // Wayland ignores client-side with_position — we move via KWin after map.
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("clipd")
-            .with_inner_size([560.0, 480.0])
+            .with_inner_size(size)
+            .with_min_inner_size([320.0, 240.0])
             .with_always_on_top()
             .with_decorations(true),
         ..Default::default()
@@ -25,20 +41,46 @@ pub fn run_show() -> Result<()> {
         "clipd",
         options,
         Box::new(move |cc| {
-            bump_fonts(&cc.egui_ctx, 1.2);
-            Ok(Box::new(PopupApp::new(items, status)))
+            apply_high_contrast(&cc.egui_ctx);
+            Ok(Box::new(PopupApp::new(items, status, size)))
         }),
     )
     .map_err(|e| anyhow::anyhow!("eframe: {e}"))?;
     Ok(())
 }
 
-fn bump_fonts(ctx: &egui::Context, scale: f32) {
+fn apply_high_contrast(ctx: &egui::Context) {
     let mut style = (*ctx.style()).clone();
     for font_id in style.text_styles.values_mut() {
-        font_id.size = (font_id.size * scale).round().clamp(12.0, 28.0);
+        font_id.size = (font_id.size * 1.25).round().clamp(13.0, 28.0);
     }
+    style.spacing.item_spacing = egui::vec2(8.0, 6.0);
+    style.spacing.button_padding = egui::vec2(10.0, 6.0);
     ctx.set_style(style);
+
+    let mut v = egui::Visuals::dark();
+    v.window_fill = BG;
+    v.panel_fill = PANEL;
+    v.extreme_bg_color = Color32::from_rgb(0x0c, 0x0e, 0x10);
+    v.faint_bg_color = HOVER;
+    v.override_text_color = Some(TEXT);
+    v.hyperlink_color = SELECTED;
+    v.warn_fg_color = AMBER;
+    v.error_fg_color = ERROR;
+    v.selection.bg_fill = SELECTED;
+    v.selection.stroke = Stroke::new(1.0, Color32::WHITE);
+    v.widgets.noninteractive.bg_fill = PANEL;
+    v.widgets.noninteractive.fg_stroke = Stroke::new(1.0, MUTED);
+    v.widgets.inactive.bg_fill = INPUT;
+    v.widgets.inactive.fg_stroke = Stroke::new(1.0, TEXT);
+    v.widgets.hovered.bg_fill = HOVER;
+    v.widgets.hovered.fg_stroke = Stroke::new(1.0, TEXT);
+    v.widgets.active.bg_fill = SELECTED;
+    v.widgets.active.fg_stroke = Stroke::new(1.0, Color32::WHITE);
+    v.widgets.open.bg_fill = HOVER;
+    v.widgets.open.fg_stroke = Stroke::new(1.0, TEXT);
+    v.window_stroke = Stroke::new(1.0, Color32::from_rgb(0x3a, 0x40, 0x48));
+    ctx.set_visuals(v);
 }
 
 struct PopupApp {
@@ -55,10 +97,13 @@ struct PopupApp {
     started: Instant,
     had_focus: bool,
     place_attempts: u8,
+    last_size: [f32; 2],
+    size_dirty: bool,
+    last_size_save: Instant,
 }
 
 impl PopupApp {
-    fn new(items: Vec<ItemMeta>, status: ipc::StatusMsg) -> Self {
+    fn new(items: Vec<ItemMeta>, status: ipc::StatusMsg, size: [f32; 2]) -> Self {
         let textures = vec![None; items.len()];
         Self {
             items,
@@ -80,7 +125,27 @@ impl PopupApp {
             started: Instant::now(),
             had_focus: false,
             place_attempts: 0,
+            last_size: size,
+            size_dirty: false,
+            last_size_save: Instant::now(),
         }
+    }
+
+    fn persist_window_size(&mut self, force: bool) {
+        if !self.size_dirty && !force {
+            return;
+        }
+        if !force && self.last_size_save.elapsed() < Duration::from_millis(400) {
+            return;
+        }
+        let mut cfg = Config::load().unwrap_or_default();
+        cfg.set_window_size(self.last_size[0], self.last_size[1]);
+        if let Err(e) = cfg.save() {
+            eprintln!("clipd: save window size: {e:#}");
+            return;
+        }
+        self.size_dirty = false;
+        self.last_size_save = Instant::now();
     }
 
     fn filtered_indices(&self) -> Vec<usize> {
@@ -113,9 +178,13 @@ impl PopupApp {
     fn refresh_status(&mut self) {
         if let Ok(s) = ipc::status_msg() {
             self.pause_remaining_secs = s.pause_remaining_secs;
-            self.max_items = s.max_items.max(1);
-            if !s.shortcut.is_empty() {
-                self.shortcut = s.shortcut;
+            // Do not overwrite max_items / shortcut here — Settings edits would be
+            // stomped every repaint before Save can run.
+            if !self.show_settings {
+                self.max_items = s.max_items.max(1);
+                if !s.shortcut.is_empty() {
+                    self.shortcut = s.shortcut;
+                }
             }
         }
     }
@@ -144,21 +213,44 @@ impl PopupApp {
 impl eframe::App for PopupApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         if self.close {
+            self.persist_window_size(true);
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
             return;
         }
+
+        // Remember resized window size.
+        // Wayland: viewport.inner_rect is often None (no global position), so use screen_rect.
+        if self.started.elapsed() > Duration::from_millis(350) {
+            let size = ctx.input(|i| {
+                i.viewport()
+                    .inner_rect
+                    .map(|r| r.size())
+                    .unwrap_or_else(|| i.screen_rect().size())
+            });
+            let w = size.x.round();
+            let h = size.y.round();
+            if w >= 320.0
+                && h >= 240.0
+                && ((w - self.last_size[0]).abs() > 1.0 || (h - self.last_size[1]).abs() > 1.0)
+            {
+                self.last_size = [w, h];
+                self.size_dirty = true;
+            }
+        }
+        self.persist_window_size(false);
 
         // Close when the popup loses focus (click elsewhere / Alt-Tab).
         let focused = ctx.input(|i| i.viewport().focused.unwrap_or(true));
         if focused {
             self.had_focus = true;
         } else if self.had_focus || self.started.elapsed() > Duration::from_millis(400) {
+            self.persist_window_size(true);
             self.close = true;
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
             return;
         }
 
-        // Plasma Wayland: ask KWin to move us to the cursor (client position is ignored).
+        // Plasma Wayland: ask KWin to move us to the cursor (and apply saved size).
         if self.place_attempts < 3 {
             let due = match self.place_attempts {
                 0 => Duration::from_millis(40),
@@ -167,67 +259,123 @@ impl eframe::App for PopupApp {
             };
             if self.started.elapsed() >= due {
                 self.place_attempts += 1;
-                if let Err(e) = plasma::move_show_to_cursor() {
+                // Reinforce size via egui too (helps when compositor accepted the map).
+                ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::vec2(
+                    self.last_size[0],
+                    self.last_size[1],
+                )));
+                if let Err(e) = plasma::move_show_to_cursor(Some(self.last_size)) {
                     eprintln!("clipd: place near cursor: {e:#}");
                 }
             }
         }
 
-        // Poll focus even when idle.
         ctx.request_repaint_after(Duration::from_millis(50));
 
-        // Keep pause countdown fresh while settings are open.
         if self.show_settings {
             self.refresh_status();
         }
 
-        egui::TopBottomPanel::top("search").show(ctx, |ui| {
-            ui.horizontal(|ui| {
-                ui.label("Search");
-                let resp = ui.text_edit_singleline(&mut self.filter);
-                if !self.show_settings {
-                    resp.request_focus();
+        egui::TopBottomPanel::top("search")
+            .frame(
+                Frame::new()
+                    .fill(PANEL)
+                    .inner_margin(Margin::symmetric(12, 10))
+                    .stroke(Stroke::new(1.0, Color32::from_rgb(0x2e, 0x34, 0x3c))),
+            )
+            .show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    let edit = egui::TextEdit::singleline(&mut self.filter)
+                        .hint_text(RichText::new("Filter…").color(MUTED))
+                        .desired_width(ui.available_width() - 100.0)
+                        .text_color(TEXT)
+                        .background_color(INPUT)
+                        .margin(Margin::symmetric(10, 8));
+                    let resp = ui.add(edit);
+                    if !self.show_settings {
+                        resp.request_focus();
+                    }
+                    if ui
+                        .add_sized(
+                            [88.0, 32.0],
+                            egui::Button::new(RichText::new("Settings").color(TEXT))
+                                .fill(if self.show_settings { SELECTED } else { INPUT }),
+                        )
+                        .clicked()
+                    {
+                        self.show_settings = !self.show_settings;
+                        if self.show_settings {
+                            // Load current daemon values once when opening the panel.
+                            if let Ok(s) = ipc::status_msg() {
+                                self.pause_remaining_secs = s.pause_remaining_secs;
+                                self.max_items = s.max_items.max(1);
+                                if !s.shortcut.is_empty() {
+                                    self.shortcut = s.shortcut;
+                                }
+                            }
+                        }
+                    }
+                });
+                if let Some(secs) = self.pause_remaining_secs {
+                    ui.add_space(4.0);
+                    ui.label(
+                        RichText::new(format!(
+                            "Shortcut paused — apps own it for {m}m {s:02}s",
+                            m = secs / 60,
+                            s = secs % 60
+                        ))
+                        .color(AMBER)
+                        .strong(),
+                    );
                 }
-                if ui
-                    .selectable_label(self.show_settings, "Settings")
-                    .clicked()
-                {
-                    self.show_settings = !self.show_settings;
+                if let Some(err) = &self.error {
+                    ui.add_space(2.0);
+                    ui.label(RichText::new(err).color(ERROR).strong());
                 }
             });
-            if let Some(secs) = self.pause_remaining_secs {
-                ui.colored_label(
-                    egui::Color32::from_rgb(200, 140, 40),
-                    format!(
-                        "Shortcut paused — apps own it for {m}m {s:02}s",
-                        m = secs / 60,
-                        s = secs % 60
-                    ),
-                );
-            }
-            if let Some(err) = &self.error {
-                ui.colored_label(egui::Color32::RED, err);
-            }
-        });
 
         if self.show_settings {
             egui::SidePanel::right("settings")
                 .resizable(true)
-                .default_width(220.0)
+                .default_width(230.0)
+                .frame(
+                    Frame::new()
+                        .fill(PANEL)
+                        .inner_margin(Margin::symmetric(12, 10))
+                        .stroke(Stroke::new(1.0, Color32::from_rgb(0x2e, 0x34, 0x3c))),
+                )
                 .show(ctx, |ui| {
-                    ui.heading("Settings");
+                    ui.heading(RichText::new("Settings").color(TEXT));
                     ui.separator();
-                    ui.label("Max history items");
-                    ui.add(egui::DragValue::new(&mut self.max_items).range(1..=5000));
+                    ui.label(RichText::new("Max history items").color(MUTED));
+                    ui.add(
+                        egui::DragValue::new(&mut self.max_items)
+                            .range(1..=50_000)
+                            .speed(1.0)
+                            .prefix(""),
+                    );
+                    ui.label(
+                        RichText::new("Click the value to type; then Save settings.")
+                            .color(MUTED)
+                            .small(),
+                    );
                     ui.add_space(8.0);
-                    ui.label("Plasma shortcut");
-                    ui.text_edit_singleline(&mut self.shortcut);
-                    ui.small("Applied via Plasma global accel (not owned by clipd).");
+                    ui.label(RichText::new("Plasma shortcut").color(MUTED));
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.shortcut)
+                            .text_color(TEXT)
+                            .background_color(INPUT),
+                    );
+                    ui.label(
+                        RichText::new("Applied via Plasma global accel (not owned by clipd).")
+                            .color(MUTED)
+                            .small(),
+                    );
                     if ui.button("Save settings").clicked() {
                         self.apply_settings();
                     }
                     ui.separator();
-                    ui.label("Pause Ctrl+D for apps");
+                    ui.label(RichText::new("Pause shortcut for apps").color(MUTED));
                     ui.horizontal_wrapped(|ui| {
                         for m in [5_u32, 15, 30, 60] {
                             if ui.button(format!("{m}m")).clicked() {
@@ -239,7 +387,13 @@ impl eframe::App for PopupApp {
                         self.pause(0);
                     }
                     ui.separator();
-                    ui.small("If apps still steal the hotkey: System Settings → Keyboard → Shortcuts → clipd History → re-bind, then Apply (or log out/in once).");
+                    ui.label(
+                        RichText::new(
+                            "If apps still steal the hotkey: System Settings → Keyboard → Shortcuts → clipd History → re-bind, then Apply (or log out/in once).",
+                        )
+                        .color(MUTED)
+                        .small(),
+                    );
                 });
         }
 
@@ -248,61 +402,160 @@ impl eframe::App for PopupApp {
             self.selected = indices.len() - 1;
         }
 
-        egui::CentralPanel::default().show(ctx, |ui| {
-            egui::ScrollArea::vertical().show(ui, |ui| {
-                let mut clicked: Option<(usize, usize)> = None;
-                for (row, &idx) in indices.iter().enumerate() {
-                    let kind = self.items[idx].kind;
-                    let selected = row == self.selected;
-                    let label = match kind {
-                        Kind::Text => {
-                            let p = &self.items[idx].preview;
-                            if p.is_empty() {
-                                "(empty text)".into()
-                            } else {
-                                p.clone()
+        egui::CentralPanel::default()
+            .frame(Frame::new().fill(BG).inner_margin(Margin::symmetric(8, 8)))
+            .show(ctx, |ui| {
+                if indices.is_empty() {
+                    ui.vertical_centered(|ui| {
+                        ui.add_space(ui.available_height() * 0.35);
+                        let msg = if self.items.is_empty() {
+                            "No clipboard history yet"
+                        } else {
+                            "No matches"
+                        };
+                        ui.label(RichText::new(msg).color(MUTED).size(18.0));
+                    });
+                    return;
+                }
+
+                egui::ScrollArea::vertical().show(ui, |ui| {
+                    let mut clicked: Option<(usize, usize)> = None;
+                    for (row, &idx) in indices.iter().enumerate() {
+                        let kind = self.items[idx].kind;
+                        let selected = row == self.selected;
+
+                        if kind == Kind::Image && self.textures[idx].is_none() {
+                            if let Some(bytes) = self.items[idx].thumb.clone() {
+                                if let Ok(img) = load_egui_image(&bytes) {
+                                    self.textures[idx] = Some(ctx.load_texture(
+                                        format!("thumb-{idx}"),
+                                        img,
+                                        Default::default(),
+                                    ));
+                                }
                             }
                         }
-                        Kind::Image => {
-                            let it = &self.items[idx];
-                            format!("[image] {} ({} KB)", it.mime, it.size / 1024)
-                        }
-                    };
 
-                    if kind == Kind::Image && self.textures[idx].is_none() {
-                        if let Some(bytes) = self.items[idx].thumb.clone() {
-                            if let Ok(img) = load_egui_image(&bytes) {
-                                self.textures[idx] = Some(ctx.load_texture(
-                                    format!("thumb-{idx}"),
-                                    img,
-                                    Default::default(),
-                                ));
+                        let preview = match kind {
+                            Kind::Text => {
+                                let p = &self.items[idx].preview;
+                                if p.is_empty() {
+                                    "(empty text)".to_string()
+                                } else {
+                                    p.clone()
+                                }
                             }
-                        }
-                    }
+                            Kind::Image => {
+                                let it = &self.items[idx];
+                                format!("{} · {} KB", it.mime, it.size / 1024)
+                            }
+                        };
 
-                    ui.horizontal(|ui| {
-                        if let Some(tex) = &self.textures[idx] {
-                            ui.image((tex.id(), egui::vec2(48.0, 48.0)));
-                        }
-                        let resp = ui.selectable_label(selected, label);
+                        let id = ui.id().with("row").with(idx);
+                        let full_w = ui.available_width();
+
+                        // Reserve height for padding + content.
+                        let row_h = if kind == Kind::Image { 64.0 } else { 44.0 };
+                        let (rect, resp) =
+                            ui.allocate_exact_size(egui::vec2(full_w, row_h), Sense::click());
+                        let hovered = resp.hovered();
+                        let fill = if selected {
+                            SELECTED
+                        } else if hovered {
+                            HOVER
+                        } else {
+                            Color32::TRANSPARENT
+                        };
+                        ui.painter().rect(
+                            rect,
+                            CornerRadius::same(6),
+                            fill,
+                            Stroke::NONE,
+                            egui::StrokeKind::Inside,
+                        );
+
+                        let text_color = if selected { Color32::WHITE } else { TEXT };
+                        let muted_color = if selected {
+                            Color32::from_rgb(0xd0, 0xe0, 0xff)
+                        } else {
+                            MUTED
+                        };
+
+                        ui.scope_builder(egui::UiBuilder::new().max_rect(rect.shrink2(egui::vec2(10.0, 6.0))), |ui| {
+                            ui.horizontal_centered(|ui| {
+                                // Kind badge chip.
+                                let (badge, badge_bg) = match kind {
+                                    Kind::Text => ("T", BADGE_TEXT),
+                                    Kind::Image => ("IMG", BADGE_IMG),
+                                };
+                                let badge_galley = ui.painter().layout_no_wrap(
+                                    badge.to_string(),
+                                    egui::FontId::proportional(11.0),
+                                    Color32::WHITE,
+                                );
+                                let badge_size = egui::vec2(
+                                    badge_galley.size().x + 12.0,
+                                    badge_galley.size().y + 6.0,
+                                );
+                                let (badge_rect, _) =
+                                    ui.allocate_exact_size(badge_size, Sense::hover());
+                                ui.painter().rect(
+                                    badge_rect,
+                                    CornerRadius::same(4),
+                                    badge_bg,
+                                    Stroke::NONE,
+                                    egui::StrokeKind::Inside,
+                                );
+                                ui.painter().galley(
+                                    badge_rect.center() - badge_galley.size() * 0.5,
+                                    badge_galley,
+                                    Color32::WHITE,
+                                );
+
+                                if let Some(tex) = &self.textures[idx] {
+                                    ui.add_space(6.0);
+                                    ui.image((tex.id(), egui::vec2(48.0, 48.0)));
+                                }
+
+                                ui.add_space(8.0);
+                                ui.vertical(|ui| {
+                                    ui.label(RichText::new(preview).color(text_color));
+                                    if kind == Kind::Image {
+                                        ui.label(
+                                            RichText::new("image")
+                                                .color(muted_color)
+                                                .small(),
+                                        );
+                                    }
+                                });
+                            });
+                        });
+
+                        // Silence unused id warning by touching it for focus rect uniqueness.
+                        let _ = id;
+
                         if resp.clicked() || resp.double_clicked() {
                             clicked = Some((row, idx));
                         }
-                    });
-                }
-                if let Some((row, idx)) = clicked {
-                    self.selected = row;
-                    self.activate(idx);
-                }
+                        if selected {
+                            ui.scroll_to_rect(rect, None);
+                        }
+
+                        ui.add_space(4.0);
+                    }
+                    if let Some((row, idx)) = clicked {
+                        self.selected = row;
+                        self.activate(idx);
+                    }
+                });
             });
-        });
 
         ctx.input(|i| {
             if i.key_pressed(egui::Key::Escape) {
                 if self.show_settings {
                     self.show_settings = false;
                 } else {
+                    self.persist_window_size(true);
                     self.close = true;
                 }
             }
