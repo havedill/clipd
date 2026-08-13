@@ -5,9 +5,10 @@ use crate::paste;
 use crate::state::DaemonState;
 use crate::store::{Kind, Store};
 use crate::tray;
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
+use std::path::Path;
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -17,32 +18,32 @@ pub fn run() -> Result<()> {
     let cfg = Config::load()?;
     let state = DaemonState::new(&cfg);
     let store = Arc::new(Mutex::new(Store::open(&cfg)?));
+    let config = Arc::new(Mutex::new(cfg));
     let suppress = Arc::new(Mutex::new(Instant::now()));
 
     let sock_path = Config::socket_path();
-    let _ = std::fs::remove_file(&sock_path);
-    let listener = UnixListener::bind(&sock_path)
-        .with_context(|| format!("bind {}", sock_path.display()))?;
+    let listener = bind_listener(&sock_path)?;
     println!("clipd: listening on {}", sock_path.display());
+
+    if let Err(e) = state.resume() {
+        eprintln!("clipd: startup shortcut sync failed: {e:#}");
+    }
 
     tray::spawn(Arc::clone(&state));
 
-    // Auto-resume when pause timer expires.
+    // Auto-resume when the pause timer expires. The state method keeps the
+    // deadline until Plasma has actually accepted the re-enable.
     {
         let state = Arc::clone(&state);
         thread::spawn(move || loop {
             thread::sleep(Duration::from_secs(1));
-            let should_resume = {
-                let guard = state.pause_until.lock().unwrap();
-                matches!(*guard, Some(until) if until <= Instant::now())
-            };
-            if should_resume {
-                state.resume();
+            if let Err(e) = state.resume_if_expired(Instant::now()) {
+                eprintln!("clipd: auto-resume failed; retrying: {e:#}");
             }
         });
     }
 
-    // Watcher thread — retry if wl-paste isn't installed yet / disappears after resume.
+    // Watcher thread — retry if wl-paste isn't installed yet.
     {
         let store = Arc::clone(&store);
         let suppress = Arc::clone(&suppress);
@@ -82,10 +83,11 @@ pub fn run() -> Result<()> {
         match conn {
             Ok(stream) => {
                 let store = Arc::clone(&store);
+                let config = Arc::clone(&config);
                 let suppress = Arc::clone(&suppress);
                 let state = Arc::clone(&state);
                 thread::spawn(move || {
-                    if let Err(e) = handle_client(stream, store, suppress, state) {
+                    if let Err(e) = handle_client(stream, store, config, suppress, state) {
                         eprintln!("clipd: ipc error: {e:#}");
                     }
                 });
@@ -96,9 +98,25 @@ pub fn run() -> Result<()> {
     Ok(())
 }
 
+fn bind_listener(path: &Path) -> Result<UnixListener> {
+    match UnixListener::bind(path) {
+        Ok(listener) => Ok(listener),
+        Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => {
+            if UnixStream::connect(path).is_ok() {
+                bail!("clipd daemon is already running");
+            }
+            std::fs::remove_file(path)
+                .with_context(|| format!("remove stale socket {}", path.display()))?;
+            UnixListener::bind(path).with_context(|| format!("bind {}", path.display()))
+        }
+        Err(e) => Err(e).with_context(|| format!("bind {}", path.display())),
+    }
+}
+
 fn handle_client(
     stream: UnixStream,
     store: Arc<Mutex<Store>>,
+    config: Arc<Mutex<Config>>,
     suppress: Arc<Mutex<Instant>>,
     state: Arc<DaemonState>,
 ) -> Result<()> {
@@ -143,14 +161,11 @@ fn handle_client(
             write_ok(&mut writer, result)?;
         }
         Request::Pause { minutes } => {
-            let result = (|| -> Result<()> {
-                if minutes == 0 {
-                    state.resume();
-                } else {
-                    state.pause_for(Duration::from_secs(u64::from(minutes) * 60));
-                }
-                Ok(())
-            })();
+            let result = if minutes == 0 {
+                state.resume()
+            } else {
+                state.pause_for(Duration::from_secs(u64::from(minutes) * 60))
+            };
             write_ok(&mut writer, result)?;
         }
         Request::SetConfig {
@@ -158,20 +173,57 @@ fn handle_client(
             shortcut,
         } => {
             let result = (|| -> Result<()> {
-                let mut cfg = Config::load()?;
+                let mut cfg = config.lock().unwrap();
+                let mut next = cfg.clone();
+                let mut shortcut_requested = false;
                 if let Some(n) = max_items {
-                    cfg.max_items = n.max(1);
-                    state.max_items.store(cfg.max_items, Ordering::SeqCst);
-                    store.lock().unwrap().set_max_items(cfg.max_items);
+                    next.max_items = n.max(1);
                 }
                 if let Some(s) = shortcut {
                     let s = s.trim().to_string();
                     if !s.is_empty() {
-                        cfg.shortcut = s.clone();
-                        state.set_shortcut(&s);
+                        next.shortcut = s;
+                        shortcut_requested = true;
                     }
                 }
-                cfg.save()?;
+
+                let old_shortcut = cfg.shortcut.clone();
+                let shortcut_changed = next.shortcut != old_shortcut;
+                if shortcut_requested {
+                    if let Err(e) = state.set_shortcut(&next.shortcut) {
+                        if shortcut_changed {
+                            if let Err(rollback) = state.set_shortcut(&old_shortcut) {
+                                eprintln!("clipd: shortcut rollback failed: {rollback:#}");
+                            }
+                        }
+                        return Err(e);
+                    }
+                }
+                if let Err(e) = next.save() {
+                    if shortcut_changed {
+                        if let Err(rollback) = state.set_shortcut(&old_shortcut) {
+                            eprintln!("clipd: shortcut rollback failed: {rollback:#}");
+                        }
+                    }
+                    return Err(e);
+                }
+
+                if next.max_items != cfg.max_items {
+                    state.max_items.store(next.max_items, Ordering::SeqCst);
+                    store.lock().unwrap().set_max_items(next.max_items);
+                }
+                *cfg = next;
+                Ok(())
+            })();
+            write_ok(&mut writer, result)?;
+        }
+        Request::SetWindowSize { width, height } => {
+            let result = (|| -> Result<()> {
+                let mut cfg = config.lock().unwrap();
+                let mut next = cfg.clone();
+                next.set_window_size(width, height);
+                next.save()?;
+                *cfg = next;
                 Ok(())
             })();
             write_ok(&mut writer, result)?;

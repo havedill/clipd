@@ -93,7 +93,13 @@ struct PopupApp {
     show_settings: bool,
     max_items: usize,
     shortcut: String,
+    /// Last values successfully written to the daemon.
+    saved_max_items: usize,
+    saved_shortcut: String,
+    /// When set, show a brief "Saved" toast until this instant.
+    saved_toast_until: Option<Instant>,
     pause_remaining_secs: Option<u64>,
+    last_status_refresh: Instant,
     started: Instant,
     had_focus: bool,
     place_attempts: u8,
@@ -105,6 +111,15 @@ struct PopupApp {
 impl PopupApp {
     fn new(items: Vec<ItemMeta>, status: ipc::StatusMsg, size: [f32; 2]) -> Self {
         let textures = vec![None; items.len()];
+        let max_items = status.max_items.max(1);
+        let pause_remaining_secs = status.pause_remaining_secs;
+        let shortcut = if status.shortcut.is_empty() {
+            Config::load()
+                .map(|c| c.shortcut)
+                .unwrap_or_else(|_| "Meta+Shift+V".into())
+        } else {
+            status.shortcut
+        };
         Self {
             items,
             filter: String::new(),
@@ -113,15 +128,13 @@ impl PopupApp {
             error: None,
             close: false,
             show_settings: false,
-            max_items: status.max_items.max(1),
-            shortcut: if status.shortcut.is_empty() {
-                Config::load()
-                    .map(|c| c.shortcut)
-                    .unwrap_or_else(|_| "Ctrl+D".into())
-            } else {
-                status.shortcut
-            },
-            pause_remaining_secs: status.pause_remaining_secs,
+            max_items,
+            shortcut: shortcut.clone(),
+            saved_max_items: max_items,
+            saved_shortcut: shortcut,
+            saved_toast_until: None,
+            pause_remaining_secs,
+            last_status_refresh: Instant::now(),
             started: Instant::now(),
             had_focus: false,
             place_attempts: 0,
@@ -138,14 +151,36 @@ impl PopupApp {
         if !force && self.last_size_save.elapsed() < Duration::from_millis(400) {
             return;
         }
-        let mut cfg = Config::load().unwrap_or_default();
-        cfg.set_window_size(self.last_size[0], self.last_size[1]);
-        if let Err(e) = cfg.save() {
+        if let Err(e) = ipc::set_window_size(self.last_size[0], self.last_size[1]) {
             eprintln!("clipd: save window size: {e:#}");
             return;
         }
         self.size_dirty = false;
         self.last_size_save = Instant::now();
+    }
+
+    fn close_settings(&mut self) {
+        self.save_settings_if_dirty();
+        self.show_settings = false;
+    }
+
+    fn settings_dirty(&self) -> bool {
+        self.max_items != self.saved_max_items || self.shortcut != self.saved_shortcut
+    }
+
+    fn save_settings_if_dirty(&mut self) {
+        if !self.settings_dirty() {
+            return;
+        }
+        self.apply_settings();
+    }
+
+    /// True when the widget interaction that may have edited a value is finished.
+    fn interaction_finished(resp: &egui::Response) -> bool {
+        resp.drag_stopped()
+            || resp.lost_focus()
+            // Wheel / button step without an active drag or text focus.
+            || (resp.changed() && !resp.dragged() && !resp.has_focus())
     }
 
     fn filtered_indices(&self) -> Vec<usize> {
@@ -178,8 +213,8 @@ impl PopupApp {
     fn refresh_status(&mut self) {
         if let Ok(s) = ipc::status_msg() {
             self.pause_remaining_secs = s.pause_remaining_secs;
-            // Do not overwrite max_items / shortcut here — Settings edits would be
-            // stomped every repaint before Save can run.
+            // Do not overwrite max_items / shortcut while the panel is open —
+            // live edits would be stomped every repaint.
             if !self.show_settings {
                 self.max_items = s.max_items.max(1);
                 if !s.shortcut.is_empty() {
@@ -187,12 +222,16 @@ impl PopupApp {
                 }
             }
         }
+        self.last_status_refresh = Instant::now();
     }
 
     fn apply_settings(&mut self) {
         match ipc::set_config(Some(self.max_items), Some(self.shortcut.clone())) {
             Ok(()) => {
                 self.error = None;
+                self.saved_max_items = self.max_items;
+                self.saved_shortcut = self.shortcut.clone();
+                self.saved_toast_until = Some(Instant::now() + Duration::from_millis(1400));
                 self.refresh_status();
             }
             Err(e) => self.error = Some(format!("{e:#}")),
@@ -271,10 +310,12 @@ impl eframe::App for PopupApp {
         }
 
         ctx.request_repaint_after(Duration::from_millis(50));
-
-        if self.show_settings {
+        if self.last_status_refresh.elapsed() >= Duration::from_secs(1) {
             self.refresh_status();
         }
+
+        // Defer toggle until after the settings panel so DragValue/TextEdit commit first.
+        let mut toggle_settings = false;
 
         egui::TopBottomPanel::top("search")
             .frame(
@@ -303,19 +344,13 @@ impl eframe::App for PopupApp {
                         )
                         .clicked()
                     {
-                        self.show_settings = !self.show_settings;
-                        if self.show_settings {
-                            // Load current daemon values once when opening the panel.
-                            if let Ok(s) = ipc::status_msg() {
-                                self.pause_remaining_secs = s.pause_remaining_secs;
-                                self.max_items = s.max_items.max(1);
-                                if !s.shortcut.is_empty() {
-                                    self.shortcut = s.shortcut;
-                                }
-                            }
-                        }
+                        toggle_settings = true;
                     }
                 });
+                if let Some(err) = &self.error {
+                    ui.add_space(2.0);
+                    ui.label(RichText::new(err).color(ERROR).strong());
+                }
                 if let Some(secs) = self.pause_remaining_secs {
                     ui.add_space(4.0);
                     ui.label(
@@ -327,10 +362,6 @@ impl eframe::App for PopupApp {
                         .color(AMBER)
                         .strong(),
                     );
-                }
-                if let Some(err) = &self.error {
-                    ui.add_space(2.0);
-                    ui.label(RichText::new(err).color(ERROR).strong());
                 }
             });
 
@@ -348,53 +379,121 @@ impl eframe::App for PopupApp {
                     ui.heading(RichText::new("Settings").color(TEXT));
                     ui.separator();
                     ui.label(RichText::new("Max history items").color(MUTED));
-                    ui.add(
+                    let max_resp = ui.add(
                         egui::DragValue::new(&mut self.max_items)
                             .range(1..=50_000)
                             .speed(1.0)
                             .prefix(""),
                     );
-                    ui.label(
-                        RichText::new("Click the value to type; then Save settings.")
-                            .color(MUTED)
-                            .small(),
-                    );
+                    if Self::interaction_finished(&max_resp) {
+                        self.save_settings_if_dirty();
+                    }
                     ui.add_space(8.0);
                     ui.label(RichText::new("Plasma shortcut").color(MUTED));
-                    ui.add(
+                    ui.label(
+                        RichText::new(
+                            "Type the chord as text (e.g. Meta+D). Do not press the keys — Plasma steals Meta/global chords before this window sees them.",
+                        )
+                        .color(MUTED)
+                        .small(),
+                    );
+                    let shortcut_resp = ui.add(
                         egui::TextEdit::singleline(&mut self.shortcut)
+                            .hint_text("Meta+Shift+V")
                             .text_color(TEXT)
                             .background_color(INPUT),
                     );
+                    if Self::interaction_finished(&shortcut_resp) {
+                        self.save_settings_if_dirty();
+                    }
+                    ui.horizontal_wrapped(|ui| {
+                        for chord in ["Meta+Shift+V", "Ctrl+Shift+V", "Ctrl+Alt+V"] {
+                            let selected = self.shortcut == chord;
+                            if ui
+                                .add(
+                                    egui::Button::new(RichText::new(chord).color(TEXT))
+                                        .fill(if selected { SELECTED } else { INPUT }),
+                                )
+                                .clicked()
+                            {
+                                self.shortcut = chord.to_string();
+                                self.save_settings_if_dirty();
+                            }
+                        }
+                    });
                     ui.label(
                         RichText::new("Applied via Plasma global accel (not owned by clipd).")
                             .color(MUTED)
                             .small(),
                     );
-                    if ui.button("Save settings").clicked() {
-                        self.apply_settings();
-                    }
                     ui.separator();
                     ui.label(RichText::new("Pause shortcut for apps").color(MUTED));
                     ui.horizontal_wrapped(|ui| {
-                        for m in [5_u32, 15, 30, 60] {
-                            if ui.button(format!("{m}m")).clicked() {
-                                self.pause(m);
+                        for minutes in [5_u32, 15, 30, 60] {
+                            if ui.button(format!("{minutes}m")).clicked() {
+                                self.pause(minutes);
                             }
                         }
                     });
                     if ui.button("Resume shortcut").clicked() {
                         self.pause(0);
                     }
+                    ui.label(
+                        RichText::new("Clipboard capture continues while the shortcut is paused.")
+                            .color(MUTED)
+                            .small(),
+                    );
                     ui.separator();
                     ui.label(
                         RichText::new(
-                            "If apps still steal the hotkey: System Settings → Keyboard → Shortcuts → clipd History → re-bind, then Apply (or log out/in once).",
+                            "If Plasma ignores the new chord: System Settings → Keyboard → Shortcuts → clipd History → set the key → Apply.",
                         )
                         .color(MUTED)
                         .small(),
                     );
                 });
+        }
+
+        if toggle_settings {
+            if self.show_settings {
+                self.close_settings();
+            } else {
+                self.show_settings = true;
+                if let Ok(s) = ipc::status_msg() {
+                    self.pause_remaining_secs = s.pause_remaining_secs;
+                    self.max_items = s.max_items.max(1);
+                    if !s.shortcut.is_empty() {
+                        self.shortcut = s.shortcut;
+                    }
+                }
+                self.saved_max_items = self.max_items;
+                self.saved_shortcut = self.shortcut.clone();
+            }
+        }
+
+        if let Some(until) = self.saved_toast_until {
+            if Instant::now() >= until {
+                self.saved_toast_until = None;
+            } else {
+                ctx.request_repaint_after(until.saturating_duration_since(Instant::now()));
+                egui::Area::new(egui::Id::new("saved_toast"))
+                    .anchor(egui::Align2::RIGHT_BOTTOM, egui::vec2(-14.0, -14.0))
+                    .order(egui::Order::Foreground)
+                    .show(ctx, |ui| {
+                        Frame::new()
+                            .fill(Color32::from_rgb(0x1e, 0x3a, 0x2f))
+                            .stroke(Stroke::new(1.0, Color32::from_rgb(0x3d, 0x9e, 0x6f)))
+                            .corner_radius(CornerRadius::same(6))
+                            .inner_margin(Margin::symmetric(12, 8))
+                            .show(ui, |ui| {
+                                ui.label(
+                                    RichText::new("Saved")
+                                        .color(Color32::from_rgb(0xb6, 0xf0, 0xce))
+                                        .strong(),
+                                );
+                            });
+                    });
+            }
         }
 
         let indices = self.filtered_indices();
@@ -550,15 +649,16 @@ impl eframe::App for PopupApp {
                 });
             });
 
-        ctx.input(|i| {
-            if i.key_pressed(egui::Key::Escape) {
-                if self.show_settings {
-                    self.show_settings = false;
-                } else {
-                    self.persist_window_size(true);
-                    self.close = true;
-                }
+        let escape = ctx.input(|i| i.key_pressed(egui::Key::Escape));
+        if escape {
+            if self.show_settings {
+                self.close_settings();
+            } else {
+                self.persist_window_size(true);
+                self.close = true;
             }
+        }
+        ctx.input(|i| {
             if i.key_pressed(egui::Key::ArrowDown) && !indices.is_empty() {
                 self.selected = (self.selected + 1).min(indices.len() - 1);
             }

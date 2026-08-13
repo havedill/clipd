@@ -20,6 +20,7 @@ pub enum Request {
         #[serde(default)]
         shortcut: Option<String>,
     },
+    SetWindowSize { width: f32, height: f32 },
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -119,4 +120,36 @@ pub fn set_config(max_items: Option<usize>, shortcut: Option<String>) -> Result<
         bail!("{}", s.error.unwrap_or_else(|| "set_config failed".into()));
     }
     Ok(())
+}
+
+pub fn set_window_size(width: f32, height: f32) -> Result<()> {
+    let s: OkMsg = roundtrip(&Request::SetWindowSize { width, height })?;
+    if !s.ok {
+        bail!(
+            "{}",
+            s.error.unwrap_or_else(|| "set_window_size failed".into())
+        );
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Request, StatusMsg};
+
+    #[test]
+    fn pause_request_keeps_wire_compatibility() {
+        let request: Request =
+            serde_json::from_str(r#"{"cmd":"pause","minutes":15}"#).unwrap();
+        assert!(matches!(request, Request::Pause { minutes: 15 }));
+    }
+
+    #[test]
+    fn old_status_without_pause_field_still_decodes() {
+        let status: StatusMsg = serde_json::from_str(
+            r#"{"ok":true,"items":2,"watching":true,"max_items":200,"shortcut":"Meta+V"}"#,
+        )
+        .unwrap();
+        assert_eq!(status.pause_remaining_secs, None);
+    }
 }

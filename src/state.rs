@@ -1,6 +1,7 @@
 use crate::config::Config;
 use crate::plasma;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use anyhow::Result;
+use std::sync::atomic::{AtomicBool, AtomicUsize};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -8,10 +9,8 @@ use std::time::{Duration, Instant};
 pub struct DaemonState {
     pub watching: AtomicBool,
     pub max_items: AtomicUsize,
-    pub pause_until: Mutex<Option<Instant>>,
     pub shortcut: Mutex<String>,
-    /// Bumped so the tray refreshes labels.
-    pub tray_tick: AtomicUsize,
+    pause_until: Mutex<Option<Instant>>,
 }
 
 impl DaemonState {
@@ -19,53 +18,73 @@ impl DaemonState {
         Arc::new(Self {
             watching: AtomicBool::new(false),
             max_items: AtomicUsize::new(cfg.max_items),
-            pause_until: Mutex::new(None),
             shortcut: Mutex::new(cfg.shortcut.clone()),
-            tray_tick: AtomicUsize::new(0),
+            pause_until: Mutex::new(None),
+        })
+    }
+
+    pub fn set_shortcut(&self, shortcut: &str) -> Result<()> {
+        let pause_until = self.pause_until.lock().unwrap();
+        plasma::set_shortcut_enabled(pause_until.is_none(), shortcut)?;
+        *self.shortcut.lock().unwrap() = shortcut.to_string();
+        Ok(())
+    }
+
+    pub fn pause_for(&self, duration: Duration) -> Result<()> {
+        let mut pause_until = self.pause_until.lock().unwrap();
+        let shortcut = self.shortcut.lock().unwrap().clone();
+        plasma::set_shortcut_enabled(false, &shortcut)?;
+        *pause_until = Some(Instant::now() + duration);
+        Ok(())
+    }
+
+    pub fn resume(&self) -> Result<()> {
+        let mut pause_until = self.pause_until.lock().unwrap();
+        let shortcut = self.shortcut.lock().unwrap().clone();
+        plasma::set_shortcut_enabled(true, &shortcut)?;
+        *pause_until = None;
+        Ok(())
+    }
+
+    /// Resume an expired pause while holding the state lock through the Plasma update.
+    pub fn resume_if_expired(&self, now: Instant) -> Result<bool> {
+        let mut pause_until = self.pause_until.lock().unwrap();
+        if !pause_expired(*pause_until, now) {
+            return Ok(false);
+        }
+        let shortcut = self.shortcut.lock().unwrap().clone();
+        plasma::set_shortcut_enabled(true, &shortcut)?;
+        *pause_until = None;
+        Ok(true)
+    }
+
+    pub fn pause_remaining_secs(&self) -> Option<u64> {
+        self.pause_until.lock().unwrap().map(|until| {
+            let remaining = until.saturating_duration_since(Instant::now());
+            remaining.as_secs() + u64::from(remaining.subsec_nanos() != 0)
         })
     }
 
     pub fn is_paused(&self) -> bool {
-        match *self.pause_until.lock().unwrap() {
-            Some(until) => until > Instant::now(),
-            None => false,
-        }
+        self.pause_until.lock().unwrap().is_some()
     }
+}
 
-    pub fn pause_remaining_secs(&self) -> Option<u64> {
-        match *self.pause_until.lock().unwrap() {
-            Some(until) if until > Instant::now() => {
-                Some(until.saturating_duration_since(Instant::now()).as_secs())
-            }
-            _ => None,
-        }
-    }
+fn pause_expired(pause_until: Option<Instant>, now: Instant) -> bool {
+    matches!(pause_until, Some(until) if until <= now)
+}
 
-    pub fn pause_for(&self, dur: Duration) {
-        let until = Instant::now() + dur;
-        *self.pause_until.lock().unwrap() = Some(until);
-        let shortcut = self.shortcut.lock().unwrap().clone();
-        if let Err(e) = plasma::set_shortcut_enabled(false, &shortcut) {
-            eprintln!("clipd: pause unbind failed: {e:#}");
-        }
-        self.tray_tick.fetch_add(1, Ordering::SeqCst);
-        eprintln!("clipd: shortcut paused for {}s", dur.as_secs());
-    }
+#[cfg(test)]
+mod tests {
+    use super::pause_expired;
+    use std::time::{Duration, Instant};
 
-    pub fn resume(&self) {
-        *self.pause_until.lock().unwrap() = None;
-        let shortcut = self.shortcut.lock().unwrap().clone();
-        if let Err(e) = plasma::set_shortcut_enabled(true, &shortcut) {
-            eprintln!("clipd: resume bind failed: {e:#}");
-        }
-        self.tray_tick.fetch_add(1, Ordering::SeqCst);
-        eprintln!("clipd: shortcut resumed");
-    }
-
-    pub fn set_shortcut(&self, shortcut: &str) {
-        *self.shortcut.lock().unwrap() = shortcut.to_string();
-        if !self.is_paused() {
-            let _ = plasma::set_shortcut_enabled(true, shortcut);
-        }
+    #[test]
+    fn pause_expires_only_at_its_deadline() {
+        let now = Instant::now();
+        assert!(!pause_expired(None, now));
+        assert!(!pause_expired(Some(now + Duration::from_secs(1)), now));
+        assert!(pause_expired(Some(now), now));
+        assert!(pause_expired(Some(now - Duration::from_secs(1)), now));
     }
 }

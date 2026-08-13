@@ -20,7 +20,7 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             max_items: 200,
-            shortcut: "Ctrl+D".into(),
+            shortcut: "Meta+Shift+V".into(),
             autostart: true,
             window_width: 560.0,
             window_height: 480.0,
@@ -66,7 +66,11 @@ impl Config {
             fs::create_dir_all(parent)?;
         }
         let text = toml::to_string_pretty(self)?;
-        fs::write(&path, text)?;
+        // Atomic replace so a concurrent reader never sees a partial file
+        // (UI window-size saves vs daemon SetConfig).
+        let tmp = path.with_extension("toml.tmp");
+        fs::write(&tmp, text)?;
+        fs::rename(&tmp, &path)?;
         Ok(())
     }
 

@@ -1,14 +1,19 @@
-//! StatusNotifierItem tray (Plasma). Pause / show / quit.
+//! StatusNotifierItem tray (Plasma). Show / pause / quit.
 
 use crate::state::DaemonState;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 pub fn spawn(state: Arc<DaemonState>) {
     std::thread::Builder::new()
         .name("clipd-tray".into())
         .spawn(move || {
             let service = ksni::TrayService::new(ClipdTray { state });
+            let handle = service.handle();
+            std::thread::spawn(move || loop {
+                std::thread::sleep(Duration::from_secs(1));
+                handle.update(|_| {});
+            });
             let _ = service.run();
         })
         .expect("spawn tray");
@@ -16,18 +21,6 @@ pub fn spawn(state: Arc<DaemonState>) {
 
 struct ClipdTray {
     state: Arc<DaemonState>,
-}
-
-impl ClipdTray {
-    fn pause_label(&self) -> String {
-        match *self.state.pause_until.lock().unwrap() {
-            Some(until) if until > Instant::now() => {
-                let secs = until.saturating_duration_since(Instant::now()).as_secs();
-                format!("Paused ({m}m {s:02}s left)", m = secs / 60, s = secs % 60)
-            }
-            _ => "Shortcut active".into(),
-        }
-    }
 }
 
 impl ksni::Tray for ClipdTray {
@@ -48,16 +41,25 @@ impl ksni::Tray for ClipdTray {
     }
 
     fn tool_tip(&self) -> ksni::ToolTip {
+        let shortcut = self.state.shortcut.lock().unwrap().clone();
+        let description = match self.state.pause_remaining_secs() {
+            Some(secs) => format!(
+                "Shortcut paused: {shortcut} ({m}m {s:02}s remaining)",
+                m = secs / 60,
+                s = secs % 60
+            ),
+            None => format!("History shortcut: {shortcut}"),
+        };
         ksni::ToolTip {
             title: "clipd".into(),
-            description: self.pause_label(),
+            description,
             ..Default::default()
         }
     }
 
     fn menu(&self) -> Vec<ksni::MenuItem<Self>> {
         use ksni::menu::*;
-        vec![
+        let mut items = vec![
             StandardItem {
                 label: "Show history".into(),
                 activate: Box::new(|_| {
@@ -68,50 +70,36 @@ impl ksni::Tray for ClipdTray {
             }
             .into(),
             MenuItem::Separator,
-            StandardItem {
-                label: self.pause_label(),
-                enabled: false,
-                ..Default::default()
-            }
-            .into(),
-            StandardItem {
-                label: "Pause shortcut 5 min".into(),
-                activate: Box::new(|t: &mut ClipdTray| {
-                    t.state.pause_for(Duration::from_secs(5 * 60))
-                }),
-                ..Default::default()
-            }
-            .into(),
-            StandardItem {
-                label: "Pause shortcut 15 min".into(),
-                activate: Box::new(|t: &mut ClipdTray| {
-                    t.state.pause_for(Duration::from_secs(15 * 60))
-                }),
-                ..Default::default()
-            }
-            .into(),
-            StandardItem {
-                label: "Pause shortcut 30 min".into(),
-                activate: Box::new(|t: &mut ClipdTray| {
-                    t.state.pause_for(Duration::from_secs(30 * 60))
-                }),
-                ..Default::default()
-            }
-            .into(),
-            StandardItem {
-                label: "Pause shortcut 60 min".into(),
-                activate: Box::new(|t: &mut ClipdTray| {
-                    t.state.pause_for(Duration::from_secs(60 * 60))
-                }),
-                ..Default::default()
-            }
-            .into(),
-            StandardItem {
-                label: "Resume shortcut".into(),
-                activate: Box::new(|t: &mut ClipdTray| t.state.resume()),
-                ..Default::default()
-            }
-            .into(),
+        ];
+        for minutes in [5_u64, 15, 30, 60] {
+            items.push(
+                StandardItem {
+                    label: format!("Pause shortcut for {minutes}m"),
+                    activate: Box::new(move |tray: &mut ClipdTray| {
+                        if let Err(e) = tray.state.pause_for(Duration::from_secs(minutes * 60)) {
+                            eprintln!("clipd: pause shortcut: {e:#}");
+                        }
+                    }),
+                    ..Default::default()
+                }
+                .into(),
+            );
+        }
+        if self.state.is_paused() {
+            items.push(
+                StandardItem {
+                    label: "Resume shortcut".into(),
+                    activate: Box::new(|tray: &mut ClipdTray| {
+                        if let Err(e) = tray.state.resume() {
+                            eprintln!("clipd: resume shortcut: {e:#}");
+                        }
+                    }),
+                    ..Default::default()
+                }
+                .into(),
+            );
+        }
+        items.extend([
             MenuItem::Separator,
             StandardItem {
                 label: "Quit daemon".into(),
@@ -119,6 +107,7 @@ impl ksni::Tray for ClipdTray {
                 ..Default::default()
             }
             .into(),
-        ]
+        ]);
+        items
     }
 }
